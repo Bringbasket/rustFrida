@@ -28,7 +28,9 @@ mod jni_core;
 mod reflect;
 mod art_method;
 mod callback;
-mod js_api;
+mod java_hook_api;
+mod java_field_api;
+mod java_method_list_api;
 
 use crate::context::JSContext;
 use crate::ffi;
@@ -40,7 +42,9 @@ use std::ffi::CString;
 use jni_core::*;
 use reflect::*;
 use callback::*;
-use js_api::*;
+use java_hook_api::*;
+use java_field_api::*;
+use java_method_list_api::*;
 
 /// Add a CFunction method to a JS object.
 macro_rules! add_method {

@@ -1,9 +1,7 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-mod jhook;
 mod gumlibc;
-mod writer;
-mod relocater;
+mod arm64_relocator;
 mod trace;
 mod exec_mem;
 mod communication;
@@ -18,7 +16,6 @@ mod qbdi_trace;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
 
-use crate::jhook::jhook;
 use crate::communication::{connect_socket, flush_cached_logs, log_msg, write_stream, GLOBAL_STREAM, SOCKET_NAME};
 use crate::crash_handler::{install_crash_handlers, install_panic_hook};
 use libc::{c_int, kill, pid_t, SIGSTOP};
@@ -31,7 +28,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub use exec_mem::ExecMem;
+pub(crate) use exec_mem::ExecMem;
 
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
@@ -183,16 +180,6 @@ fn process_cmd(command: &str) {
                     }
                 }
                 unsafe { kill(process::id() as pid_t, SIGSTOP) }
-            });
-        },
-        Some("jhook") => {
-            std::thread::spawn(|| {
-                match jhook() {
-                    Ok(_) => {},
-                    Err(e) => {
-                        write_stream(format!("{}", e).as_bytes());
-                    }
-                }
             });
         },
         #[cfg(feature = "frida-gum")]

@@ -1,0 +1,390 @@
+//! JS API: Java.getField / Java._getFieldAuto + shared field-value reader
+
+use crate::ffi;
+use crate::value::JSValue;
+use std::ffi::CString;
+
+use super::jni_core::*;
+use super::reflect::*;
+use super::art_method::*;
+use super::callback::*;
+
+// ============================================================================
+// Shared field-value reader (used by getField and _getFieldAuto)
+// ============================================================================
+
+pub(super) enum ObjectFieldMode {
+    RawPointer,
+    WrappedProxy { type_name: String },
+}
+
+/// Read a single field value from a JNI object, dispatching on the JNI type signature.
+/// For 'L'/'[' fields: String fields become JS strings; other objects are handled
+/// according to `mode` (RawPointer returns BigUint64, WrappedProxy returns {__jptr, __jclass}).
+unsafe fn read_field_value(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    obj: *mut std::ffi::c_void,
+    field_id: *mut std::ffi::c_void,
+    jni_sig: &str,
+    mode: ObjectFieldMode,
+) -> ffi::JSValue {
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let sig_bytes = jni_sig.as_bytes();
+    match sig_bytes.first() {
+        Some(b'Z') => {
+            let f: GetBooleanFieldFn = jni_fn!(env, GetBooleanFieldFn, JNI_GET_BOOLEAN_FIELD);
+            JSValue::bool(f(env, obj, field_id) != 0).raw()
+        }
+        Some(b'B') => {
+            let f: GetByteFieldFn = jni_fn!(env, GetByteFieldFn, JNI_GET_BYTE_FIELD);
+            JSValue::int(f(env, obj, field_id) as i32).raw()
+        }
+        Some(b'C') => {
+            let f: GetCharFieldFn = jni_fn!(env, GetCharFieldFn, JNI_GET_CHAR_FIELD);
+            JSValue::int(f(env, obj, field_id) as i32).raw()
+        }
+        Some(b'S') => {
+            let f: GetShortFieldFn = jni_fn!(env, GetShortFieldFn, JNI_GET_SHORT_FIELD);
+            JSValue::int(f(env, obj, field_id) as i32).raw()
+        }
+        Some(b'I') => {
+            let f: GetIntFieldFn = jni_fn!(env, GetIntFieldFn, JNI_GET_INT_FIELD);
+            JSValue::int(f(env, obj, field_id)).raw()
+        }
+        Some(b'J') => {
+            let f: GetLongFieldFn = jni_fn!(env, GetLongFieldFn, JNI_GET_LONG_FIELD);
+            ffi::JS_NewBigUint64(ctx, f(env, obj, field_id) as u64)
+        }
+        Some(b'F') => {
+            let f: GetFloatFieldFn = jni_fn!(env, GetFloatFieldFn, JNI_GET_FLOAT_FIELD);
+            JSValue::float(f(env, obj, field_id) as f64).raw()
+        }
+        Some(b'D') => {
+            let f: GetDoubleFieldFn = jni_fn!(env, GetDoubleFieldFn, JNI_GET_DOUBLE_FIELD);
+            JSValue::float(f(env, obj, field_id)).raw()
+        }
+        Some(b'L') | Some(b'[') => {
+            let f: GetObjectFieldFn = jni_fn!(env, GetObjectFieldFn, JNI_GET_OBJECT_FIELD);
+            let obj_val = f(env, obj, field_id);
+
+            if obj_val.is_null() {
+                return ffi::qjs_null();
+            }
+
+            // Check if String type
+            if jni_sig == "Ljava/lang/String;" {
+                let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+                let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+
+                let chars = get_str(env, obj_val, std::ptr::null_mut());
+                let js_result = if !chars.is_null() {
+                    let s = std::ffi::CStr::from_ptr(chars)
+                        .to_string_lossy()
+                        .to_string();
+                    rel_str(env, obj_val, chars);
+                    JSValue::string(ctx, &s).raw()
+                } else {
+                    ffi::qjs_null()
+                };
+                delete_local_ref(env, obj_val);
+                return js_result;
+            }
+
+            match mode {
+                ObjectFieldMode::RawPointer => {
+                    let ptr_val = obj_val as u64;
+                    delete_local_ref(env, obj_val);
+                    ffi::JS_NewBigUint64(ctx, ptr_val)
+                }
+                ObjectFieldMode::WrappedProxy { ref type_name } => {
+                    let wrapper = ffi::JS_NewObject(ctx);
+                    let wrapper_val = JSValue(wrapper);
+
+                    let ptr_val = ffi::JS_NewBigUint64(ctx, obj_val as u64);
+                    wrapper_val.set_property(ctx, "__jptr", JSValue(ptr_val));
+
+                    let cls_val = JSValue::string(ctx, type_name);
+                    wrapper_val.set_property(ctx, "__jclass", cls_val);
+
+                    // Don't delete obj_val — keep local ref alive for chained access
+                    wrapper
+                }
+            }
+        }
+        _ => ffi::qjs_undefined(),
+    }
+}
+
+// ============================================================================
+// JS API: Java.getField(objPtr, className, fieldName, fieldSig)
+// ============================================================================
+
+pub(super) unsafe extern "C" fn js_java_get_field(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    use crate::jsapi::ptr::get_native_pointer_addr;
+
+    if argc < 4 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java.getField() requires 4 arguments: objPtr, className, fieldName, fieldSig\0"
+                .as_ptr() as *const _,
+        );
+    }
+
+    let obj_arg = JSValue(*argv);
+    let class_arg = JSValue(*argv.add(1));
+    let method_arg = JSValue(*argv.add(2));
+    let sig_arg = JSValue(*argv.add(3));
+
+    // Extract objPtr — try NativePointer first, then BigUint64/Number
+    let obj_ptr = if let Some(addr) = get_native_pointer_addr(ctx, obj_arg) {
+        addr
+    } else if let Some(addr) = obj_arg.to_u64(ctx) {
+        addr
+    } else {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java.getField() first argument must be a pointer (BigUint64/Number/NativePointer)\0"
+                .as_ptr() as *const _,
+        );
+    };
+
+    if obj_ptr == 0 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java.getField() objPtr is null\0".as_ptr() as *const _,
+        );
+    }
+
+    let class_name = match class_arg.to_string(ctx) {
+        Some(s) => s,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Java.getField() className must be a string\0".as_ptr() as *const _,
+            )
+        }
+    };
+
+    let field_name = match method_arg.to_string(ctx) {
+        Some(s) => s,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Java.getField() fieldName must be a string\0".as_ptr() as *const _,
+            )
+        }
+    };
+
+    let field_sig = match sig_arg.to_string(ctx) {
+        Some(s) => s,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Java.getField() fieldSig must be a string\0".as_ptr() as *const _,
+            )
+        }
+    };
+
+    // Get thread-safe JNIEnv*
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(msg) => {
+            let err = CString::new(msg).unwrap();
+            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        }
+    };
+
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let get_field_id: GetFieldIdFn = jni_fn!(env, GetFieldIdFn, JNI_GET_FIELD_ID);
+
+    // FindClass — use find_class_safe to support app classes
+    let cls = find_class_safe(env, &class_name);
+    if cls.is_null() {
+        let err = CString::new(format!("FindClass('{}') failed", class_name)).unwrap();
+        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    }
+
+    // NewLocalRef — wrap raw mirror pointer as a proper JNI local ref
+    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+    if local_obj.is_null() {
+        delete_local_ref(env, cls);
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"NewLocalRef failed for objPtr\0".as_ptr() as *const _,
+        );
+    }
+
+    // GetFieldID
+    let c_field = match CString::new(field_name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            delete_local_ref(env, local_obj);
+            delete_local_ref(env, cls);
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"invalid field name\0".as_ptr() as *const _,
+            );
+        }
+    };
+    let c_sig = match CString::new(field_sig.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            delete_local_ref(env, local_obj);
+            delete_local_ref(env, cls);
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"invalid field signature\0".as_ptr() as *const _,
+            );
+        }
+    };
+
+    let field_id = get_field_id(env, cls, c_field.as_ptr(), c_sig.as_ptr());
+    if field_id.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, local_obj);
+        delete_local_ref(env, cls);
+        let err = CString::new(format!(
+            "GetFieldID failed: {}.{} (sig={})",
+            class_name, field_name, field_sig
+        ))
+        .unwrap();
+        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    }
+
+    // Check for unsupported signature before calling read_field_value
+    let sig_first = field_sig.as_bytes().first().copied();
+    if !matches!(sig_first, Some(b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' | b'L' | b'[')) {
+        delete_local_ref(env, local_obj);
+        delete_local_ref(env, cls);
+        let err = CString::new(format!("unsupported field signature: {}", field_sig)).unwrap();
+        return ffi::JS_ThrowTypeError(ctx, err.as_ptr());
+    }
+
+    // Dispatch via shared helper (RawPointer mode — returns BigUint64 for objects)
+    let result = read_field_value(ctx, env, local_obj, field_id, &field_sig, ObjectFieldMode::RawPointer);
+
+    // Check for JNI exception after field access
+    if jni_check_exc(env) {
+        delete_local_ref(env, local_obj);
+        delete_local_ref(env, cls);
+        let err = CString::new(format!(
+            "JNI exception reading field {}.{}",
+            class_name, field_name
+        ))
+        .unwrap();
+        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    }
+
+    delete_local_ref(env, local_obj);
+    delete_local_ref(env, cls);
+    result
+}
+
+// ============================================================================
+// JS API: Java._getFieldAuto(objPtr, className, fieldName)
+//   Auto-detects field type via JNI reflection, returns value directly.
+//   Returns undefined for missing fields (Proxy-friendly).
+// ============================================================================
+
+pub(super) unsafe extern "C" fn js_java_get_field_auto(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    use crate::jsapi::ptr::get_native_pointer_addr;
+
+    if argc < 3 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"_getFieldAuto() requires 3 arguments: objPtr, className, fieldName\0".as_ptr()
+                as *const _,
+        );
+    }
+
+    let obj_arg = JSValue(*argv);
+    let _class_arg = JSValue(*argv.add(1));
+    let field_arg = JSValue(*argv.add(2));
+
+    // Extract objPtr
+    let obj_ptr = if let Some(addr) = get_native_pointer_addr(ctx, obj_arg) {
+        addr
+    } else if let Some(addr) = obj_arg.to_u64(ctx) {
+        addr
+    } else {
+        return ffi::qjs_undefined();
+    };
+
+    if obj_ptr == 0 {
+        return ffi::qjs_null();
+    }
+
+    let field_name = match field_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+
+    // Look up field in pre-computed cache (safe — no JNI reflection calls)
+    let (jni_sig, field_id, type_name) = {
+        let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = match guard.as_ref() {
+            Some(c) => c,
+            None => return ffi::qjs_undefined(),
+        };
+        // className is passed from the Proxy wrapper (e.g. "android.app.Activity")
+        let class_name = match _class_arg.to_string(ctx) {
+            Some(s) => s,
+            None => return ffi::qjs_undefined(),
+        };
+        let class_fields = match cache.get(&class_name) {
+            Some(f) => f,
+            None => return ffi::qjs_undefined(),
+        };
+        let info = match class_fields.get(&field_name) {
+            Some(i) => i,
+            None => return ffi::qjs_undefined(), // field not found
+        };
+        // Extract the type name from jni_sig for object handling
+        let tn = match info.jni_sig.as_bytes().first() {
+            Some(b'L') => {
+                // "Ljava/lang/String;" → "java.lang.String"
+                let inner = &info.jni_sig[1..info.jni_sig.len() - 1];
+                inner.replace('/', ".")
+            }
+            _ => String::new(),
+        };
+        (info.jni_sig.clone(), info.field_id, tn)
+    };
+
+    // Get thread-safe JNIEnv*
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(_) => return ffi::qjs_undefined(),
+    };
+
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+
+    // NewLocalRef — wraps raw mirror pointer as JNI local ref
+    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+    if local_obj.is_null() {
+        return ffi::qjs_undefined();
+    }
+
+    // Dispatch via shared helper (WrappedProxy mode — returns {__jptr, __jclass} for objects)
+    let mode = ObjectFieldMode::WrappedProxy { type_name: type_name.clone() };
+    let result = read_field_value(ctx, env, local_obj, field_id, &jni_sig, mode);
+
+    // Check for JNI exception
+    jni_check_exc(env);
+
+    delete_local_ref(env, local_obj);
+    result
+}

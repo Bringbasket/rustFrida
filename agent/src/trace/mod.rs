@@ -2,10 +2,12 @@
 
 mod ptrace_ops;
 mod arm64_analysis;
+mod arm64_codegen;
 mod transformer;
 
 pub use arm64_analysis::{is_arm64_branch, is_arm64_call, resolve_next_addr, analyze_branch_regs, BranchRegUsage};
-pub use transformer::{gum_modify_thread, transformer_global, transformer_wrapper_full, gen_mov_reg_addr, gen_jump_to_transformer};
+pub use arm64_codegen::{gen_mov_reg_addr, gen_jump_to_transformer};
+pub use transformer::{gum_modify_thread, transformer_global, transformer_wrapper_full};
 pub use ptrace_ops::get_registers;
 
 #[repr(C)]
