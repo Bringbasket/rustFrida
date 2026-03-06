@@ -490,31 +490,34 @@ void arm64_writer_put_stp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Re
  * Arithmetic Instructions
  * ============================================================================ */
 
-void arm64_writer_put_add_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, uint64_t imm) {
+/* Internal helper for ADD/SUB immediate encoding.
+ * op_base: 0x11000000 for ADD, 0x51000000 for SUB
+ * op_shift: 0x11400000 for ADD LSL#12, 0x51400000 for SUB LSL#12 */
+static void arm64_writer_put_addsub_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src,
+                                                  uint64_t imm, uint32_t op_base, uint32_t op_shift) {
     uint32_t rd = ARM64_REG_NUM(dst);
     uint32_t rn = ARM64_REG_NUM(src);
     uint32_t sf = ARM64_REG_SF(dst);
 
     if (imm <= 0xFFF) {
-        /* ADD (immediate): sf 0 0 10001 shift imm12 Rn Rd */
-        uint32_t insn = (sf << 31) | 0x11000000 | ((uint32_t)imm << 10) | (rn << 5) | rd;
+        uint32_t insn = (sf << 31) | op_base | ((uint32_t)imm << 10) | (rn << 5) | rd;
         arm64_writer_put_insn(w, insn);
     } else if ((imm & 0xFFF) == 0 && (imm >> 12) <= 0xFFF) {
-        /* ADD with shift=1 (LSL #12) */
-        uint32_t insn = (sf << 31) | 0x11400000 | ((uint32_t)(imm >> 12) << 10) | (rn << 5) | rd;
+        uint32_t insn = (sf << 31) | op_shift | ((uint32_t)(imm >> 12) << 10) | (rn << 5) | rd;
         arm64_writer_put_insn(w, insn);
     } else if ((imm >> 12) <= 0xFFF) {
-        /* Both hi12 and lo12 are non-zero: emit two ADD instructions.
-         * First:  ADD Xd, Xn, #hi12, LSL #12
-         * Second: ADD Xd, Xd, #lo12           (note: src for 2nd is rd, not rn) */
         uint32_t hi12 = (uint32_t)(imm >> 12) & 0xFFF;
         uint32_t lo12 = (uint32_t)(imm & 0xFFF);
-        uint32_t insn1 = (sf << 31) | 0x11400000 | (hi12 << 10) | (rn << 5) | rd;
-        uint32_t insn2 = (sf << 31) | 0x11000000 | (lo12 << 10) | (rd << 5) | rd;
+        uint32_t insn1 = (sf << 31) | op_shift | (hi12 << 10) | (rn << 5) | rd;
+        uint32_t insn2 = (sf << 31) | op_base  | (lo12 << 10) | (rd << 5) | rd;
         arm64_writer_put_insn(w, insn1);
         arm64_writer_put_insn(w, insn2);
     }
     /* Immediates > 24 bits are not handled; callers must use register form. */
+}
+
+void arm64_writer_put_add_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, uint64_t imm) {
+    arm64_writer_put_addsub_reg_reg_imm(w, dst, src, imm, 0x11000000, 0x11400000);
 }
 
 void arm64_writer_put_add_reg_reg_reg(Arm64Writer* w, Arm64Reg dst, Arm64Reg left, Arm64Reg right) {
@@ -529,30 +532,7 @@ void arm64_writer_put_add_reg_reg_reg(Arm64Writer* w, Arm64Reg dst, Arm64Reg lef
 }
 
 void arm64_writer_put_sub_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, uint64_t imm) {
-    uint32_t rd = ARM64_REG_NUM(dst);
-    uint32_t rn = ARM64_REG_NUM(src);
-    uint32_t sf = ARM64_REG_SF(dst);
-
-    if (imm <= 0xFFF) {
-        /* SUB (immediate): sf 1 0 10001 shift imm12 Rn Rd */
-        uint32_t insn = (sf << 31) | 0x51000000 | ((uint32_t)imm << 10) | (rn << 5) | rd;
-        arm64_writer_put_insn(w, insn);
-    } else if ((imm & 0xFFF) == 0 && (imm >> 12) <= 0xFFF) {
-        /* SUB with shift=1 (LSL #12) */
-        uint32_t insn = (sf << 31) | 0x51400000 | ((uint32_t)(imm >> 12) << 10) | (rn << 5) | rd;
-        arm64_writer_put_insn(w, insn);
-    } else if ((imm >> 12) <= 0xFFF) {
-        /* Both hi12 and lo12 are non-zero: emit two SUB instructions.
-         * First:  SUB Xd, Xn, #hi12, LSL #12
-         * Second: SUB Xd, Xd, #lo12           (note: src for 2nd is rd, not rn) */
-        uint32_t hi12 = (uint32_t)(imm >> 12) & 0xFFF;
-        uint32_t lo12 = (uint32_t)(imm & 0xFFF);
-        uint32_t insn1 = (sf << 31) | 0x51400000 | (hi12 << 10) | (rn << 5) | rd;
-        uint32_t insn2 = (sf << 31) | 0x51000000 | (lo12 << 10) | (rd << 5) | rd;
-        arm64_writer_put_insn(w, insn1);
-        arm64_writer_put_insn(w, insn2);
-    }
-    /* Immediates > 24 bits are not handled; callers must use register form. */
+    arm64_writer_put_addsub_reg_reg_imm(w, dst, src, imm, 0x51000000, 0x51400000);
 }
 
 void arm64_writer_put_sub_reg_reg_reg(Arm64Writer* w, Arm64Reg dst, Arm64Reg left, Arm64Reg right) {

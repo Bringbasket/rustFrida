@@ -262,87 +262,36 @@ int arm64_relocator_read_one(Arm64Relocator* r) {
  * Instruction Relocation
  * ============================================================================ */
 
-/* Try to relocate B/BL */
-static Arm64RelocResult try_relocate_b_bl(uint64_t src_pc, uint64_t dst_pc,
-                                           uint32_t insn, uint32_t* out) {
-    if ((insn & 0x7C000000) != 0x14000000) {
-        return ARM64_RELOC_ERROR; /* Not a B/BL */
-    }
+/* Generic helper: relocate a PC-relative instruction with a single contiguous
+ * immediate field.  Covers B/BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, LDR literal
+ * (GPR/LDRSW/FP), and PRFM literal.
+ *
+ * Parameters:
+ *   match_mask/match_val  — instruction identification
+ *   hi/lo                 — bit range of the immediate field
+ *   width                 — sign-extension width of the raw immediate
+ *   imm_mask              — mask for the relocated immediate bits
+ */
+static Arm64RelocResult try_relocate_pcrel_imm(
+        uint64_t src_pc, uint64_t dst_pc, uint32_t insn, uint32_t* out,
+        uint32_t match_mask, uint32_t match_val,
+        int hi, int lo, int width, uint32_t imm_mask) {
+    if ((insn & match_mask) != match_val) return ARM64_RELOC_ERROR;
 
-    uint32_t imm26 = GET_BITS(insn, 25, 0);
-    int64_t offset = sign_extend(imm26, 26) << 2;
+    uint32_t imm = GET_BITS(insn, hi, lo);
+    int64_t offset = sign_extend(imm, width) << 2;
     int64_t target = (int64_t)src_pc + offset;
     int64_t new_offset = target - (int64_t)dst_pc;
 
     if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm26 = new_offset >> 2;
-    if (!fits_signed(new_imm26, 26)) return ARM64_RELOC_OUT_OF_RANGE;
+    int64_t new_imm = new_offset >> 2;
+    if (!fits_signed(new_imm, width)) return ARM64_RELOC_OUT_OF_RANGE;
 
-    *out = SET_BITS(insn, 25, 0, (uint32_t)new_imm26 & 0x03FFFFFF);
+    *out = SET_BITS(insn, hi, lo, (uint32_t)new_imm & imm_mask);
     return ARM64_RELOC_OK;
 }
 
-/* Try to relocate B.cond */
-static Arm64RelocResult try_relocate_b_cond(uint64_t src_pc, uint64_t dst_pc,
-                                             uint32_t insn, uint32_t* out) {
-    if ((insn & 0xFF000010) != 0x54000000) {
-        return ARM64_RELOC_ERROR;
-    }
-
-    uint32_t imm19 = GET_BITS(insn, 23, 5);
-    int64_t offset = sign_extend(imm19, 19) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
-
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm19 = new_offset >> 2;
-    if (!fits_signed(new_imm19, 19)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 23, 5, (uint32_t)new_imm19 & 0x7FFFF);
-    return ARM64_RELOC_OK;
-}
-
-/* Try to relocate CBZ/CBNZ */
-static Arm64RelocResult try_relocate_cbz_cbnz(uint64_t src_pc, uint64_t dst_pc,
-                                               uint32_t insn, uint32_t* out) {
-    if ((insn & 0x7E000000) != 0x34000000) {
-        return ARM64_RELOC_ERROR;
-    }
-
-    uint32_t imm19 = GET_BITS(insn, 23, 5);
-    int64_t offset = sign_extend(imm19, 19) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
-
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm19 = new_offset >> 2;
-    if (!fits_signed(new_imm19, 19)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 23, 5, (uint32_t)new_imm19 & 0x7FFFF);
-    return ARM64_RELOC_OK;
-}
-
-/* Try to relocate TBZ/TBNZ */
-static Arm64RelocResult try_relocate_tbz_tbnz(uint64_t src_pc, uint64_t dst_pc,
-                                               uint32_t insn, uint32_t* out) {
-    if ((insn & 0x7E000000) != 0x36000000) {
-        return ARM64_RELOC_ERROR;
-    }
-
-    uint32_t imm14 = GET_BITS(insn, 18, 5);
-    int64_t offset = sign_extend(imm14, 14) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
-
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm14 = new_offset >> 2;
-    if (!fits_signed(new_imm14, 14)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 18, 5, (uint32_t)new_imm14 & 0x3FFF);
-    return ARM64_RELOC_OK;
-}
-
-/* Try to relocate ADR */
+/* ADR: split immediate (immhi:immlo), no shift */
 static Arm64RelocResult try_relocate_adr(uint64_t src_pc, uint64_t dst_pc,
                                           uint32_t insn, uint32_t* out) {
     if ((insn & 0x9F000000) != 0x10000000) {
@@ -366,7 +315,7 @@ static Arm64RelocResult try_relocate_adr(uint64_t src_pc, uint64_t dst_pc,
     return ARM64_RELOC_OK;
 }
 
-/* Try to relocate ADRP */
+/* ADRP: split immediate, page-aligned */
 static Arm64RelocResult try_relocate_adrp(uint64_t src_pc, uint64_t dst_pc,
                                            uint32_t insn, uint32_t* out) {
     if ((insn & 0x9F000000) != 0x90000000) {
@@ -394,98 +343,45 @@ static Arm64RelocResult try_relocate_adrp(uint64_t src_pc, uint64_t dst_pc,
     return ARM64_RELOC_OK;
 }
 
-/* Try to relocate LDR literal (GPR) / LDRSW literal */
-static Arm64RelocResult try_relocate_ldr_literal(uint64_t src_pc, uint64_t dst_pc,
-                                                  uint32_t insn, uint32_t* out) {
-    int is_gpr = (insn & 0xBF000000) == 0x18000000;
-    int is_ldrsw = (insn & 0xFF000000) == 0x98000000;
-    if (!is_gpr && !is_ldrsw) {
-        return ARM64_RELOC_ERROR;
-    }
+/* Instruction relocation dispatch table — all single-field PC-relative types */
+typedef struct {
+    uint32_t match_mask;
+    uint32_t match_val;
+    int hi, lo, width;
+    uint32_t imm_mask;
+} PcrelImmDesc;
 
-    uint32_t imm19 = GET_BITS(insn, 23, 5);
-    int64_t offset = sign_extend(imm19, 19) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
+static const PcrelImmDesc pcrel_table[] = {
+    { 0x7C000000, 0x14000000, 25, 0, 26, 0x03FFFFFF }, /* B / BL          */
+    { 0xFF000010, 0x54000000, 23, 5, 19, 0x7FFFF },    /* B.cond          */
+    { 0x7E000000, 0x34000000, 23, 5, 19, 0x7FFFF },    /* CBZ / CBNZ      */
+    { 0x7E000000, 0x36000000, 18, 5, 14, 0x3FFF },     /* TBZ / TBNZ      */
+    { 0xBF000000, 0x18000000, 23, 5, 19, 0x7FFFF },    /* LDR literal GPR */
+    { 0xFF000000, 0x98000000, 23, 5, 19, 0x7FFFF },    /* LDRSW literal   */
+    { 0x3F000000, 0x1C000000, 23, 5, 19, 0x7FFFF },    /* LDR literal FP  */
+    { 0xFF000000, 0xD8000000, 23, 5, 19, 0x7FFFF },    /* PRFM literal    */
+};
 
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm19 = new_offset >> 2;
-    if (!fits_signed(new_imm19, 19)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 23, 5, (uint32_t)new_imm19 & 0x7FFFF);
-    return ARM64_RELOC_OK;
-}
-
-/* Try to relocate LDR literal (FP/SIMD) */
-static Arm64RelocResult try_relocate_ldr_literal_fp(uint64_t src_pc, uint64_t dst_pc,
-                                                     uint32_t insn, uint32_t* out) {
-    if ((insn & 0x3F000000) != 0x1C000000) {
-        return ARM64_RELOC_ERROR;
-    }
-
-    uint32_t imm19 = GET_BITS(insn, 23, 5);
-    int64_t offset = sign_extend(imm19, 19) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
-
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm19 = new_offset >> 2;
-    if (!fits_signed(new_imm19, 19)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 23, 5, (uint32_t)new_imm19 & 0x7FFFF);
-    return ARM64_RELOC_OK;
-}
-
-/* Try to relocate PRFM literal */
-static Arm64RelocResult try_relocate_prfm_literal(uint64_t src_pc, uint64_t dst_pc,
-                                                   uint32_t insn, uint32_t* out) {
-    if ((insn & 0xFF000000) != 0xD8000000) {
-        return ARM64_RELOC_ERROR;
-    }
-
-    uint32_t imm19 = GET_BITS(insn, 23, 5);
-    int64_t offset = sign_extend(imm19, 19) << 2;
-    int64_t target = (int64_t)src_pc + offset;
-    int64_t new_offset = target - (int64_t)dst_pc;
-
-    if ((new_offset & 0x3) != 0) return ARM64_RELOC_OUT_OF_RANGE;
-    int64_t new_imm19 = new_offset >> 2;
-    if (!fits_signed(new_imm19, 19)) return ARM64_RELOC_OUT_OF_RANGE;
-
-    *out = SET_BITS(insn, 23, 5, (uint32_t)new_imm19 & 0x7FFFF);
-    return ARM64_RELOC_OK;
-}
+#define PCREL_TABLE_SIZE (sizeof(pcrel_table) / sizeof(pcrel_table[0]))
 
 Arm64RelocResult arm64_relocator_relocate_insn(uint64_t src_pc, uint64_t dst_pc,
                                                 uint32_t insn, uint32_t* out) {
     Arm64RelocResult result;
 
-    /* Try each PC-relative instruction type */
-    result = try_relocate_b_bl(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
+    /* Try table-driven relocation for single-field PC-relative instructions */
+    for (int i = 0; i < (int)PCREL_TABLE_SIZE; i++) {
+        const PcrelImmDesc* d = &pcrel_table[i];
+        result = try_relocate_pcrel_imm(src_pc, dst_pc, insn, out,
+                                         d->match_mask, d->match_val,
+                                         d->hi, d->lo, d->width, d->imm_mask);
+        if (result != ARM64_RELOC_ERROR) return result;
+    }
 
-    result = try_relocate_b_cond(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
-    result = try_relocate_cbz_cbnz(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
-    result = try_relocate_tbz_tbnz(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
+    /* ADR / ADRP — split immediate fields, handled separately */
     result = try_relocate_adr(src_pc, dst_pc, insn, out);
     if (result != ARM64_RELOC_ERROR) return result;
 
     result = try_relocate_adrp(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
-    result = try_relocate_ldr_literal(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
-    result = try_relocate_ldr_literal_fp(src_pc, dst_pc, insn, out);
-    if (result != ARM64_RELOC_ERROR) return result;
-
-    result = try_relocate_prfm_literal(src_pc, dst_pc, insn, out);
     if (result != ARM64_RELOC_ERROR) return result;
 
     /* Not a PC-relative instruction, copy as-is */

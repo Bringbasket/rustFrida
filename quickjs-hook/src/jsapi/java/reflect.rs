@@ -10,165 +10,131 @@ use std::os::raw::c_char;
 use super::jni_core::*;
 
 // ============================================================================
-// Encoded jmethodID decoder (Android 11+)
+// Encoded jmethodID / jfieldID decoder (Android 11+)
 // ============================================================================
 
-/// Decode a jmethodID to a raw ArtMethod pointer.
-/// On Android 11+ (API 30+), jmethodIDs for app classes may be encoded
-/// (bit 0 = 1) rather than raw ArtMethod pointers.
+/// Generic JNI ID decoder.  Shared logic for both jmethodID and jfieldID.
 ///
 /// Strategy (对标 Frida unwrapGenericId):
-/// 1. 快速路径: 读取 jni_ids_indirection_ == kPointer → 直接返回
+/// 1. 快速路径: jni_ids_indirection_ == kPointer → 直接返回
 /// 2. bit 0 == 0 → 原始指针，无需解码
-/// 3. JniIdManager::DecodeMethodId (dlsym 直接调用，不修改 ART 状态)
-/// 4. Fallback: ToReflectedMethod → Method 对象 → artMethod 字段
-///
-/// Requires `cls` (the jclass the method belongs to) and `is_static` flag.
+/// 3. JniIdManager decode 函数 (dlsym 直接调用)
+/// 4. Fallback: ToReflected* → reflect 对象 → art* 字段 (long)
+/// Common fn signature for ToReflectedMethod / ToReflectedField
+type ToReflectedFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8,
+) -> *mut std::ffi::c_void;
+
+unsafe fn decode_jni_id<F1, F2>(
+    env: JniEnv,
+    cls: *mut std::ffi::c_void,
+    id: u64,
+    is_static: bool,
+    label: &str,
+    art_label: &str,
+    art_short: &str,
+    decode_via_manager: F1,
+    get_reflect_field_id: F2,
+    to_reflected_fn: ToReflectedFn,
+) -> u64
+where
+    F1: FnOnce(u64) -> Option<u64>,
+    F2: FnOnce(&ReflectIds) -> *mut std::ffi::c_void,
+{
+    if id == 0 { return 0; }
+
+    if super::jni_core::is_jni_pointer_mode() {
+        return id;
+    }
+
+    if id & 1 == 0 {
+        return id;
+    }
+
+    // Strategy 1: JniIdManager decode (对标 Frida unwrapGenericId)
+    if let Some(result) = decode_via_manager(id) {
+        if result != id {
+            output_message(&format!(
+                "[jni] decode_{label}({id:#x}): Decode → {art_label}={result:#x}"
+            ));
+        }
+        return result;
+    }
+
+    // Strategy 2: Fallback — ToReflected* → art* 字段 (long)
+    let art_field_id = match REFLECT_IDS.get() {
+        Some(r) => {
+            let fid = get_reflect_field_id(r);
+            if fid.is_null() {
+                output_message(&format!(
+                    "[jni] decode_{label}({id:#x}): no decoder available, returning raw"
+                ));
+                return id;
+            }
+            fid
+        }
+        _ => {
+            output_message(&format!(
+                "[jni] decode_{label}({id:#x}): no decoder available, returning raw"
+            ));
+            return id;
+        }
+    };
+
+    let get_long: GetLongFieldFn = jni_fn!(env, GetLongFieldFn, JNI_GET_LONG_FIELD);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let reflected_obj = to_reflected_fn(
+        env, cls, id as *mut std::ffi::c_void,
+        if is_static { 1 } else { 0 },
+    );
+    if reflected_obj.is_null() || jni_check_exc(env) {
+        output_message(&format!(
+            "[jni] decode_{label}({id:#x}): ToReflected failed"
+        ));
+        return id;
+    }
+
+    let art_ptr = get_long(env, reflected_obj, art_field_id) as u64;
+    delete_local_ref(env, reflected_obj);
+
+    output_message(&format!(
+        "[jni] decode_{label}({id:#x}) → {art_short}={art_ptr:#x} (via reflection)"
+    ));
+
+    art_ptr
+}
+
 pub(super) unsafe fn decode_method_id(
     env: JniEnv,
     cls: *mut std::ffi::c_void,
     method_id: u64,
     is_static: bool,
 ) -> u64 {
-    // 快速路径: 读取当前 indirection 模式 (对标 Frida: 每次读取而非缓存)
-    if super::jni_core::is_jni_pointer_mode() {
-        return method_id;
-    }
-
-    // bit 0 == 0 → raw ArtMethod* 指针，无需解码
-    if method_id & 1 == 0 {
-        return method_id;
-    }
-
-    // Strategy 1: JniIdManager::DecodeMethodId (对标 Frida unwrapGenericId)
-    // 通过 dlsym 获取的 ART 内部函数直接解码，不修改运行时状态
-    if let Some(result) = super::jni_core::decode_method_id_via_manager(method_id) {
-        if result != method_id {
-            output_message(&format!(
-                "[jni] decode_method_id({:#x}): DecodeMethodId → ArtMethod*={:#x}",
-                method_id, result
-            ));
-        }
-        return result;
-    }
-
-    // Strategy 2: Fallback — ToReflectedMethod → artMethod 字段 (long)
-    let reflect = match REFLECT_IDS.get() {
-        Some(r) if !r.art_method_field_id.is_null() => r,
-        _ => {
-            output_message(&format!(
-                "[jni] decode_method_id({:#x}): no decoder available, returning raw",
-                method_id
-            ));
-            return method_id;
-        }
-    };
-
     let to_reflected: ToReflectedMethodFn = jni_fn!(env, ToReflectedMethodFn, JNI_TO_REFLECTED_METHOD);
-    let get_long: GetLongFieldFn = jni_fn!(env, GetLongFieldFn, JNI_GET_LONG_FIELD);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let method_obj = to_reflected(
-        env, cls, method_id as *mut std::ffi::c_void,
-        if is_static { 1 } else { 0 },
-    );
-    if method_obj.is_null() || jni_check_exc(env) {
-        output_message(&format!(
-            "[jni] decode_method_id({:#x}): ToReflectedMethod failed", method_id
-        ));
-        return method_id;
-    }
-
-    let art_method = get_long(env, method_obj, reflect.art_method_field_id) as u64;
-    delete_local_ref(env, method_obj);
-
-    output_message(&format!(
-        "[jni] decode_method_id({:#x}) → artMethod={:#x} (via reflection)", method_id, art_method
-    ));
-
-    art_method
+    decode_jni_id(
+        env, cls, method_id, is_static,
+        "method_id", "ArtMethod*", "artMethod",
+        |id| super::jni_core::decode_method_id_via_manager(id),
+        |r| r.art_method_field_id,
+        to_reflected,
+    )
 }
 
-// ============================================================================
-// Encoded jfieldID decoder (Android 11+)
-// ============================================================================
-
-/// Decode a jfieldID to a raw ArtField pointer.
-/// On Android 11+ (API 30+), jfieldIDs may be opaque indices rather than
-/// raw ArtField pointers when `jni_ids_indirection != kPointer`.
-///
-/// Strategy (对标 Frida unwrapGenericId):
-/// 1. 快速路径: 读取 jni_ids_indirection_ == kPointer → 直接返回
-/// 2. bit 0 == 0 → 原始指针，无需解码
-/// 3. JniIdManager::DecodeFieldId (dlsym 直接调用，不修改 ART 状态)
-/// 4. Fallback: ToReflectedField → Field 对象 → artField 字段
 pub(super) unsafe fn decode_field_id(
     env: JniEnv,
     cls: *mut std::ffi::c_void,
     field_id: u64,
     is_static: bool,
 ) -> u64 {
-    // null 检查
-    if field_id == 0 {
-        return 0;
-    }
-
-    // 快速路径: 读取当前 indirection 模式
-    if super::jni_core::is_jni_pointer_mode() {
-        return field_id;
-    }
-
-    // bit 0 == 0 → 原始 ArtField* 指针，无需解码
-    if field_id & 1 == 0 {
-        return field_id;
-    }
-
-    // Strategy 1: JniIdManager::DecodeFieldId (对标 Frida unwrapGenericId)
-    if let Some(result) = super::jni_core::decode_field_id_via_manager(field_id) {
-        if result != field_id {
-            output_message(&format!(
-                "[jni] decode_field_id({:#x}): DecodeFieldId → ArtField*={:#x}",
-                field_id, result
-            ));
-        }
-        return result;
-    }
-
-    // Strategy 2: Fallback — ToReflectedField → artField 字段 (long)
-    let reflect = match REFLECT_IDS.get() {
-        Some(r) if !r.art_field_field_id.is_null() => r,
-        _ => {
-            output_message(&format!(
-                "[jni] decode_field_id({:#x}): no decoder available, returning raw",
-                field_id
-            ));
-            return field_id;
-        }
-    };
-
     let to_reflected: ToReflectedFieldFn = jni_fn!(env, ToReflectedFieldFn, JNI_TO_REFLECTED_FIELD);
-    let get_long: GetLongFieldFn = jni_fn!(env, GetLongFieldFn, JNI_GET_LONG_FIELD);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let field_obj = to_reflected(
-        env, cls, field_id as *mut std::ffi::c_void,
-        if is_static { 1 } else { 0 },
-    );
-    if field_obj.is_null() || jni_check_exc(env) {
-        output_message(&format!(
-            "[jni] decode_field_id({:#x}): ToReflectedField failed", field_id
-        ));
-        return field_id;
-    }
-
-    let art_field = get_long(env, field_obj, reflect.art_field_field_id) as u64;
-    delete_local_ref(env, field_obj);
-
-    output_message(&format!(
-        "[jni] decode_field_id({:#x}) → artField={:#x} (via reflection)", field_id, art_field
-    ));
-
-    art_field
+    decode_jni_id(
+        env, cls, field_id, is_static,
+        "field_id", "ArtField*", "artField",
+        |id| super::jni_core::decode_field_id_via_manager(id),
+        |r| r.art_field_field_id,
+        to_reflected,
+    )
 }
 
 // ============================================================================
