@@ -306,6 +306,48 @@ pub fn register_java_api(ctx: &JSContext) {
     }
 }
 
+unsafe fn release_java_hook_resources(
+    data: &JavaHookData,
+    env_opt: Option<JniEnv>,
+    remove_runtime_hooks: bool,
+    free_replacement: bool,
+) {
+    match &data.hook_type {
+        callback::HookType::Replaced {
+            replacement_addr,
+            per_method_hook_target,
+        } => {
+            if remove_runtime_hooks {
+                if let Some(target) = per_method_hook_target {
+                    hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
+                }
+
+                hook_ffi::hook_remove_redirect(data.art_method);
+            }
+
+            if free_replacement && *replacement_addr != 0 {
+                libc::free(*replacement_addr as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    if data.clone_addr != 0 {
+        libc::free(data.clone_addr as *mut std::ffi::c_void);
+    }
+
+    if data.class_global_ref != 0 {
+        if let Some(env) = env_opt {
+            let delete_global_ref: DeleteGlobalRefFn =
+                jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+            delete_global_ref(env, data.class_global_ref as *mut std::ffi::c_void);
+        }
+    }
+
+    let ctx = data.ctx as *mut ffi::JSContext;
+    let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+    ffi::qjs_free_value(ctx, callback);
+}
+
 /// Cleanup all Java hooks (call before dropping context)
 ///
 /// Frida revert() 风格: 恢复全部 ArtMethod 字段，清理 replacedMethods 映射。
@@ -365,9 +407,14 @@ pub fn cleanup_java_hooks() {
         }
     } // guard dropped — 释放锁让 in-flight callback 能获取锁并安全退出
 
-    // 短暂等待让 in-flight thunk 回调完成
-    // ArtMethod 已恢复 → 不会有新线程进入 thunk，只需等待已在 thunk 中的线程退出
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // 等待已进入 thunk 的回调自然退出。
+    // ArtMethod 已恢复后不会再有新回调进入，因此这里等待 in-flight 计数清零即可。
+    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
+        output_message(&format!(
+            "[java cleanup] 等待 in-flight callbacks 超时，remaining={}",
+            in_flight_java_hook_callbacks()
+        ));
+    }
 
     // 移除 artController 全局 hook (Layer 1/2/GC)
     // 此时 ArtMethod 已全部恢复，移除 Layer 1 hook 后不会有线程进入 thunk
@@ -389,45 +436,7 @@ pub fn cleanup_java_hooks() {
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {
             unsafe {
-                match &data.hook_type {
-                    callback::HookType::Replaced {
-                        replacement_addr,
-                        per_method_hook_target,
-                    } => {
-                        // 移除 per-method 路由 hook (Layer 3, if any)
-                        if let Some(target) = per_method_hook_target {
-                            hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
-                        }
-
-                        // 移除 native trampoline
-                        hook_ffi::hook_remove_redirect(data.art_method);
-
-                        // 释放 replacement ArtMethod (malloc 分配)
-                        if *replacement_addr != 0 {
-                            libc::free(*replacement_addr as *mut std::ffi::c_void);
-                        }
-                    }
-                }
-
-                // 释放 backup clone (callOriginal)
-                if data.clone_addr != 0 {
-                    libc::free(data.clone_addr as *mut std::ffi::c_void);
-                }
-
-                // 删除 JNI global ref
-                if data.class_global_ref != 0 {
-                    if let Some(env) = env_opt {
-                        let delete_global_ref: DeleteGlobalRefFn =
-                            jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
-                        delete_global_ref(env, data.class_global_ref as *mut std::ffi::c_void);
-                    }
-                }
-
-                // 释放 JS callback
-                let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue =
-                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
+                release_java_hook_resources(&data, env_opt, true, true);
             }
         }
     }

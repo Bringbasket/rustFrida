@@ -300,29 +300,15 @@ unsafe fn build_jargs_from_registers(
 /// Invokes the cloned ArtMethod via JNI CallNonvirtual*MethodA / CallStatic*MethodA.
 /// Returns the method's return value as a JS value.
 ///
-/// Must be called from within a java_hook_callback (reads CURRENT_HOOK_* globals).
+/// Must be called from a hook context object created by java_hook_callback.
 unsafe extern "C" fn js_call_original(
     ctx: *mut ffi::JSContext,
     this_val: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let art_method_addr = {
-        let value = get_js_u64_property(ctx, this_val, "__hookArtMethod");
-        if value != 0 {
-            value
-        } else {
-            CURRENT_HOOK_ART_METHOD.load(Ordering::Relaxed)
-        }
-    };
-    let ctx_ptr = {
-        let value = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
-        if !value.is_null() {
-            value
-        } else {
-            CURRENT_HOOK_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext
-        }
-    };
+    let art_method_addr = get_js_u64_property(ctx, this_val, "__hookArtMethod");
+    let ctx_ptr = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
     if ctx_ptr.is_null() || art_method_addr == 0 {
         return ffi::JS_ThrowInternalError(
             ctx,

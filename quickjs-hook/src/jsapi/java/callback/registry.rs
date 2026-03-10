@@ -50,11 +50,61 @@ unsafe impl Sync for JavaHookData {}
 /// Global Java hook registry keyed by art_method address
 pub(super) static JAVA_HOOK_REGISTRY: Mutex<Option<HashMap<u64, JavaHookData>>> = Mutex::new(None);
 
-// Callback state globals — set before JS_Call in java_hook_callback, read by js_call_original.
-// Protected by JS_ENGINE lock (single-threaded JS execution). Use atomics to avoid UB from
-// static mut in multi-threaded context.
-pub(super) static CURRENT_HOOK_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
-pub(super) static CURRENT_HOOK_ART_METHOD: AtomicU64 = AtomicU64::new(0);
+pub(super) static IN_FLIGHT_JAVA_HOOK_CALLBACKS: Mutex<usize> = Mutex::new(0);
+pub(super) static IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV: Condvar = Condvar::new();
+
+/// RAII guard for callbacks that already entered the Java hook trampoline path.
+///
+/// cleanup_java_hooks() waits on this counter instead of relying on a blind sleep.
+pub(super) struct InFlightJavaHookGuard;
+
+impl InFlightJavaHookGuard {
+    pub(super) fn enter() -> Self {
+        let mut in_flight = IN_FLIGHT_JAVA_HOOK_CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *in_flight += 1;
+        Self
+    }
+}
+
+impl Drop for InFlightJavaHookGuard {
+    fn drop(&mut self) {
+        let mut in_flight = IN_FLIGHT_JAVA_HOOK_CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        if *in_flight == 0 {
+            IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV.notify_all();
+        }
+    }
+}
+
+pub(super) fn in_flight_java_hook_callbacks() -> usize {
+    *IN_FLIGHT_JAVA_HOOK_CALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+pub(super) fn wait_for_in_flight_java_hook_callbacks(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut in_flight = IN_FLIGHT_JAVA_HOOK_CALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while *in_flight != 0 {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return false;
+        };
+        let (guard, wait_result) = IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV
+            .wait_timeout(in_flight, remaining)
+            .unwrap_or_else(|e| e.into_inner());
+        in_flight = guard;
+        if wait_result.timed_out() && *in_flight != 0 {
+            return false;
+        }
+    }
+    true
+}
 
 /// Parse JNI signature to extract the return type character.
 /// "(II)V" → b'V', "(Ljava/lang/String;)Ljava/lang/Object;" → b'L'

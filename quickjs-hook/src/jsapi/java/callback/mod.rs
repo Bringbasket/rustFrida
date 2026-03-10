@@ -16,8 +16,7 @@ use crate::jsapi::callback_util::{
 use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use super::jni_core::*;
 use super::reflect::{find_class_safe, REFLECT_IDS};

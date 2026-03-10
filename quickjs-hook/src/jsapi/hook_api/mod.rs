@@ -8,6 +8,7 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::util::add_cfunction_to_object;
 
+use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
 use functions::{js_call_native, js_hook, js_unhook};
 use registry::HOOK_REGISTRY;
 
@@ -38,6 +39,13 @@ pub fn cleanup_hooks() {
             unsafe {
                 ffi::hook::hook_remove(*addr as *mut std::ffi::c_void);
             }
+        }
+        // 只要 hook_remove 已经完成，就不会再有新回调进入；等待已在 thunk 中的回调退出。
+        if !wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(200)) {
+            crate::jsapi::console::output_message(&format!(
+                "[hook cleanup] waiting for in-flight callbacks timed out, remaining={}",
+                in_flight_native_hook_callbacks()
+            ));
         }
         // 第二阶段：所有 hook 已移除，安全释放 callback
         for (_addr, data) in registry {

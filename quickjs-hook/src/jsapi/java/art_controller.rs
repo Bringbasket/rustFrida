@@ -19,7 +19,7 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use super::art_method::{
     get_instrumentation_spec, read_entry_point, try_invalidate_jit_cache, ArtBridgeFunctions,
@@ -178,8 +178,10 @@ struct ArtControllerState {
 unsafe impl Send for ArtControllerState {}
 unsafe impl Sync for ArtControllerState {}
 
-/// 全局单例: artController 状态
-static ART_CONTROLLER: OnceLock<ArtControllerState> = OnceLock::new();
+/// 全局 artController 状态。
+///
+/// 使用 Mutex<Option<_>> 而不是 OnceLock，这样 cleanup 后可以在新的 JS 引擎生命周期中重新初始化。
+static ART_CONTROLLER: Mutex<Option<ArtControllerState>> = Mutex::new(None);
 
 // ============================================================================
 // 初始化
@@ -187,7 +189,7 @@ static ART_CONTROLLER: OnceLock<ArtControllerState> = OnceLock::new();
 
 /// 惰性初始化 artController: 安装 Layer 1 (共享 stub 路由) + Layer 2 (DoCall hook)。
 ///
-/// 使用 OnceLock 保证只初始化一次。首次调用 Java.hook() 时触发。
+/// 每个 JS 引擎生命周期内最多初始化一次；cleanup 后允许重新初始化。
 ///
 /// Layer 1: 对 3 个共享 stub 安装 hook_install_art_router，路由 hook 方法到 replacement
 /// Layer 2: 对 DoCall 安装 hook_attach，拦截解释器路径
@@ -196,264 +198,271 @@ pub(super) fn ensure_art_controller_initialized(
     ep_offset: usize,
     env: *mut std::ffi::c_void,
 ) {
-    ART_CONTROLLER.get_or_init(|| {
-        output_message("[artController] 开始安装三层拦截矩阵...");
+    let mut controller = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    if controller.is_some() {
+        return;
+    }
 
-        // 提前探测 ArtThreadSpec (递归防护 stack check 需要)
-        let _ = get_art_thread_spec(env as JniEnv);
-        let _ = get_managed_stack_spec();
+    output_message("[artController] 开始安装三层拦截矩阵...");
 
-        // B3: 自动清空 JIT 缓存 — 使已内联被 hook 方法的 JIT 代码失效
-        unsafe { try_invalidate_jit_cache(); }
+    // 提前探测 ArtThreadSpec (递归防护 stack check 需要)
+    let _ = get_art_thread_spec(env as JniEnv);
+    let _ = get_managed_stack_spec();
 
-        // B4: 设置 forced_interpret_only — 阻止 JIT 重编译
-        unsafe { set_forced_interpret_only(); }
+    // B3: 自动清空 JIT 缓存 — 使已内联被 hook 方法的 JIT 代码失效
+    unsafe {
+        try_invalidate_jit_cache();
+    }
 
-        let mut shared_stub_targets = Vec::new();
-        let mut do_call_targets = Vec::new();
+    // B4: 设置 forced_interpret_only — 阻止 JIT 重编译
+    unsafe {
+        set_forced_interpret_only();
+    }
 
-        // --- Layer 1: 共享 stub 路由 hook ---
-        let stubs = [
-            ("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline),
-            ("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge),
-            ("quick_resolution_trampoline", bridge.quick_resolution_trampoline),
-        ];
+    let mut shared_stub_targets = Vec::new();
+    let mut do_call_targets = Vec::new();
 
-        for (name, addr) in &stubs {
-            if *addr == 0 {
-                output_message(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
-                continue;
-            }
-            let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-            let trampoline = unsafe {
-                hook_ffi::hook_install_art_router(
-                    *addr as *mut std::ffi::c_void,
-                    ep_offset as u32,
-                    stealth_flag(),
-                    env,
-                    &mut hooked_target,
-                )
-            };
-            if !trampoline.is_null() {
-                // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
-                let actual_target = if !hooked_target.is_null() {
-                    hooked_target as u64
-                } else {
-                    *addr
-                };
-                shared_stub_targets.push(actual_target);
-                output_message(&format!(
-                    "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
-                    name, addr, actual_target, trampoline as u64
-                ));
+    // --- Layer 1: 共享 stub 路由 hook ---
+    let stubs = [
+        ("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline),
+        ("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge),
+        ("quick_resolution_trampoline", bridge.quick_resolution_trampoline),
+    ];
+
+    for (name, addr) in &stubs {
+        if *addr == 0 {
+            output_message(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
+            continue;
+        }
+        let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+        let trampoline = unsafe {
+            hook_ffi::hook_install_art_router(
+                *addr as *mut std::ffi::c_void,
+                ep_offset as u32,
+                stealth_flag(),
+                env,
+                &mut hooked_target,
+            )
+        };
+        if !trampoline.is_null() {
+            // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
+            let actual_target = if !hooked_target.is_null() {
+                hooked_target as u64
             } else {
-                output_message(&format!(
-                    "[artController] Layer 1: {} hook 安装失败: {:#x}", name, addr
-                ));
-            }
-        }
-
-        // --- Layer 2: DoCall hook (解释器路径) ---
-        for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
-            if addr == 0 {
-                continue;
-            }
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    addr as *mut std::ffi::c_void,
-                    Some(on_do_call_enter),
-                    None,
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
+                *addr
             };
-            if ret == 0 {
-                do_call_targets.push(addr);
-                output_message(&format!(
-                    "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}", i, addr
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] Layer 2: DoCall[{}] hook 安装失败: {:#x} (ret={})", i, addr, ret
-                ));
-            }
+            shared_stub_targets.push(actual_target);
+            output_message(&format!(
+                "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
+                name, addr, actual_target, trampoline as u64
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] Layer 1: {} hook 安装失败: {:#x}", name, addr
+            ));
         }
+    }
 
-        // --- GC 同步 hooks ---
-        // GC 可能移动 ArtMethod 的 entry_point / declaring_class_，需要在多个 GC 点同步
-        let mut gc_hook_targets = Vec::new();
-
-        // Fix 3: hook CopyingPhase/MarkingPhase on_leave
-        if bridge.gc_copying_phase != 0 {
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    bridge.gc_copying_phase as *mut std::ffi::c_void,
-                    None,
-                    Some(on_gc_sync_leave),
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if ret == 0 {
-                gc_hook_targets.push(bridge.gc_copying_phase);
-                output_message(&format!(
-                    "[artController] GC CopyingPhase hook 安装成功: {:#x}", bridge.gc_copying_phase
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] GC CopyingPhase hook 安装失败: {:#x} (ret={})",
-                    bridge.gc_copying_phase, ret
-                ));
-            }
+    // --- Layer 2: DoCall hook (解释器路径) ---
+    for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
+        if addr == 0 {
+            continue;
         }
-
-        // Fix 3: hook CollectGarbageInternal on_leave (主 GC 入口)
-        if bridge.gc_collect_internal != 0 {
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    bridge.gc_collect_internal as *mut std::ffi::c_void,
-                    None,
-                    Some(on_gc_sync_leave),
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if ret == 0 {
-                gc_hook_targets.push(bridge.gc_collect_internal);
-                output_message(&format!(
-                    "[artController] GC CollectGarbageInternal hook 安装成功: {:#x}",
-                    bridge.gc_collect_internal
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] GC CollectGarbageInternal hook 安装失败: {:#x} (ret={})",
-                    bridge.gc_collect_internal, ret
-                ));
-            }
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                addr as *mut std::ffi::c_void,
+                Some(on_do_call_enter),
+                None,
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            do_call_targets.push(addr);
+            output_message(&format!(
+                "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}", i, addr
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] Layer 2: DoCall[{}] hook 安装失败: {:#x} (ret={})", i, addr, ret
+            ));
         }
+    }
 
-        // Fix 3: hook RunFlipFunction on_enter (线程翻转期间同步)
-        if bridge.run_flip_function != 0 {
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    bridge.run_flip_function as *mut std::ffi::c_void,
-                    Some(on_gc_sync_enter),
-                    None,
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if ret == 0 {
-                gc_hook_targets.push(bridge.run_flip_function);
-                output_message(&format!(
-                    "[artController] GC RunFlipFunction hook 安装成功: {:#x}",
-                    bridge.run_flip_function
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] GC RunFlipFunction hook 安装失败: {:#x} (ret={})",
-                    bridge.run_flip_function, ret
-                ));
-            }
+    // --- GC 同步 hooks ---
+    // GC 可能移动 ArtMethod 的 entry_point / declaring_class_，需要在多个 GC 点同步
+    let mut gc_hook_targets = Vec::new();
+
+    // Fix 3: hook CopyingPhase/MarkingPhase on_leave
+    if bridge.gc_copying_phase != 0 {
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                bridge.gc_copying_phase as *mut std::ffi::c_void,
+                None,
+                Some(on_gc_sync_leave),
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            gc_hook_targets.push(bridge.gc_copying_phase);
+            output_message(&format!(
+                "[artController] GC CopyingPhase hook 安装成功: {:#x}", bridge.gc_copying_phase
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] GC CopyingPhase hook 安装失败: {:#x} (ret={})",
+                bridge.gc_copying_phase, ret
+            ));
         }
+    }
 
-        // --- Fix 4: hook GetOatQuickMethodHeader (replace mode) ---
-        // 对 replacement method 返回 NULL，防止 ART 查找堆分配方法的 OAT 代码头
-        let mut oat_header_hook_target: u64 = 0;
-        if bridge.get_oat_quick_method_header != 0 {
-            let trampoline = unsafe {
-                hook_ffi::hook_replace(
-                    bridge.get_oat_quick_method_header as *mut std::ffi::c_void,
-                    Some(on_get_oat_quick_method_header),
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if !trampoline.is_null() {
-                oat_header_hook_target = bridge.get_oat_quick_method_header;
-                output_message(&format!(
-                    "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x}, trampoline={:#x}",
-                    bridge.get_oat_quick_method_header, trampoline as u64
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] GetOatQuickMethodHeader hook 安装失败: {:#x}",
-                    bridge.get_oat_quick_method_header
-                ));
-            }
+    // Fix 3: hook CollectGarbageInternal on_leave (主 GC 入口)
+    if bridge.gc_collect_internal != 0 {
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                bridge.gc_collect_internal as *mut std::ffi::c_void,
+                None,
+                Some(on_gc_sync_leave),
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            gc_hook_targets.push(bridge.gc_collect_internal);
+            output_message(&format!(
+                "[artController] GC CollectGarbageInternal hook 安装成功: {:#x}",
+                bridge.gc_collect_internal
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] GC CollectGarbageInternal hook 安装失败: {:#x} (ret={})",
+                bridge.gc_collect_internal, ret
+            ));
         }
+    }
 
-        // --- Fix 5: hook FixupStaticTrampolines on_leave ---
-        // 类初始化完成后同步 replacement 方法，防止 quickCode 被更新绕过 hook
-        let mut fixup_hook_target: u64 = 0;
-        if bridge.fixup_static_trampolines != 0 {
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    bridge.fixup_static_trampolines as *mut std::ffi::c_void,
-                    None,
-                    Some(on_gc_sync_leave),
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if ret == 0 {
-                fixup_hook_target = bridge.fixup_static_trampolines;
-                output_message(&format!(
-                    "[artController] FixupStaticTrampolines hook 安装成功: {:#x}",
-                    bridge.fixup_static_trampolines
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] FixupStaticTrampolines hook 安装失败: {:#x} (ret={})",
-                    bridge.fixup_static_trampolines, ret
-                ));
-            }
+    // Fix 3: hook RunFlipFunction on_enter (线程翻转期间同步)
+    if bridge.run_flip_function != 0 {
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                bridge.run_flip_function as *mut std::ffi::c_void,
+                Some(on_gc_sync_enter),
+                None,
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            gc_hook_targets.push(bridge.run_flip_function);
+            output_message(&format!(
+                "[artController] GC RunFlipFunction hook 安装成功: {:#x}",
+                bridge.run_flip_function
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] GC RunFlipFunction hook 安装失败: {:#x} (ret={})",
+                bridge.run_flip_function, ret
+            ));
         }
+    }
 
-        // --- Fix: hook PrettyMethod (NULL 指针崩溃防护) ---
-        let mut pretty_method_hook_target: u64 = 0;
-        if bridge.pretty_method != 0 {
-            let ret = unsafe {
-                hook_ffi::hook_attach(
-                    bridge.pretty_method as *mut std::ffi::c_void,
-                    Some(on_pretty_method_enter),
-                    None,
-                    std::ptr::null_mut(),
-                    stealth_flag(),
-                )
-            };
-            if ret == 0 {
-                pretty_method_hook_target = bridge.pretty_method;
-                output_message(&format!(
-                    "[artController] PrettyMethod hook 安装成功: {:#x}",
-                    bridge.pretty_method
-                ));
-            } else {
-                output_message(&format!(
-                    "[artController] PrettyMethod hook 安装失败: {:#x} (ret={})",
-                    bridge.pretty_method, ret
-                ));
-            }
+    // --- Fix 4: hook GetOatQuickMethodHeader (replace mode) ---
+    // 对 replacement method 返回 NULL，防止 ART 查找堆分配方法的 OAT 代码头
+    let mut oat_header_hook_target: u64 = 0;
+    if bridge.get_oat_quick_method_header != 0 {
+        let trampoline = unsafe {
+            hook_ffi::hook_replace(
+                bridge.get_oat_quick_method_header as *mut std::ffi::c_void,
+                Some(on_get_oat_quick_method_header),
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if !trampoline.is_null() {
+            oat_header_hook_target = bridge.get_oat_quick_method_header;
+            output_message(&format!(
+                "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x}, trampoline={:#x}",
+                bridge.get_oat_quick_method_header, trampoline as u64
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] GetOatQuickMethodHeader hook 安装失败: {:#x}",
+                bridge.get_oat_quick_method_header
+            ));
         }
+    }
 
-        output_message(&format!(
-            "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}",
-            shared_stub_targets.len(),
-            do_call_targets.len(),
-            gc_hook_targets.len(),
-            if oat_header_hook_target != 0 { "active" } else { "none" },
-            if fixup_hook_target != 0 { "active" } else { "none" },
-            if pretty_method_hook_target != 0 { "active" } else { "none" },
-        ));
-
-        ArtControllerState {
-            shared_stub_targets,
-            do_call_targets,
-            gc_hook_targets,
-            oat_header_hook_target,
-            fixup_hook_target,
-            pretty_method_hook_target,
+    // --- Fix 5: hook FixupStaticTrampolines on_leave ---
+    // 类初始化完成后同步 replacement 方法，防止 quickCode 被更新绕过 hook
+    let mut fixup_hook_target: u64 = 0;
+    if bridge.fixup_static_trampolines != 0 {
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                bridge.fixup_static_trampolines as *mut std::ffi::c_void,
+                None,
+                Some(on_gc_sync_leave),
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            fixup_hook_target = bridge.fixup_static_trampolines;
+            output_message(&format!(
+                "[artController] FixupStaticTrampolines hook 安装成功: {:#x}",
+                bridge.fixup_static_trampolines
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] FixupStaticTrampolines hook 安装失败: {:#x} (ret={})",
+                bridge.fixup_static_trampolines, ret
+            ));
         }
+    }
+
+    // --- Fix: hook PrettyMethod (NULL 指针崩溃防护) ---
+    let mut pretty_method_hook_target: u64 = 0;
+    if bridge.pretty_method != 0 {
+        let ret = unsafe {
+            hook_ffi::hook_attach(
+                bridge.pretty_method as *mut std::ffi::c_void,
+                Some(on_pretty_method_enter),
+                None,
+                std::ptr::null_mut(),
+                stealth_flag(),
+            )
+        };
+        if ret == 0 {
+            pretty_method_hook_target = bridge.pretty_method;
+            output_message(&format!(
+                "[artController] PrettyMethod hook 安装成功: {:#x}",
+                bridge.pretty_method
+            ));
+        } else {
+            output_message(&format!(
+                "[artController] PrettyMethod hook 安装失败: {:#x} (ret={})",
+                bridge.pretty_method, ret
+            ));
+        }
+    }
+
+    output_message(&format!(
+        "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}",
+        shared_stub_targets.len(),
+        do_call_targets.len(),
+        gc_hook_targets.len(),
+        if oat_header_hook_target != 0 { "active" } else { "none" },
+        if fixup_hook_target != 0 { "active" } else { "none" },
+        if pretty_method_hook_target != 0 { "active" } else { "none" },
+    ));
+
+    *controller = Some(ArtControllerState {
+        shared_stub_targets,
+        do_call_targets,
+        gc_hook_targets,
+        oat_header_hook_target,
+        fixup_hook_target,
+        pretty_method_hook_target,
     });
 }
 
@@ -761,22 +770,17 @@ unsafe fn synchronize_replacement_methods() {
 /// 清理所有 artController 全局 hook
 ///
 /// 移除 Layer 1 (共享 stub 路由 hook) 和 Layer 2 (DoCall hook)。
-/// 调用路径: cleanup_java_hooks() → cleanup_art_controller()
-/// 幂等保护: cleanup_art_controller 只执行一次
-static ART_CONTROLLER_CLEANED: AtomicBool = AtomicBool::new(false);
-
 pub(super) fn cleanup_art_controller() {
-    // 幂等: JSEngine::Drop 和 cleanup_java_hooks 都可能调用此函数
-    if ART_CONTROLLER_CLEANED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
     // 恢复 instrumentation 状态 (在移除 hooks 之前)
     unsafe {
         restore_forced_interpret_only();
     }
 
-    let state = match ART_CONTROLLER.get() {
+    let state = {
+        let mut guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    let state = match state {
         Some(s) => s,
         None => return, // 从未初始化，无需清理
     };
@@ -810,5 +814,6 @@ pub(super) fn cleanup_art_controller() {
         }
     }
 
+    LAST_SEEN_ART_METHOD.store(0, Ordering::Relaxed);
     output_message("[artController] 全局 ART hook 清理完成");
 }

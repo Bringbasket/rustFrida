@@ -76,6 +76,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
+    let _in_flight_guard = InFlightJavaHookGuard::enter();
 
     // user_data is ArtMethod* address (used as registry key)
     let art_method_addr = user_data as u64;
@@ -129,10 +130,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             hook_data.class_global_ref,
         )
     }; // lock released
-
-    // Set callback state globals for js_call_original
-    CURRENT_HOOK_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
-    CURRENT_HOOK_ART_METHOD.store(art_method_addr, Ordering::Relaxed);
 
     // Push local frame to protect JNI local refs from overflowing the table.
     // Each marshal_jni_arg_to_js call may create local refs (GetStringUTFChars, NewObject, etc.).
@@ -283,8 +280,4 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             pop_frame(hook_ctx_env, std::ptr::null_mut());
         }
     }
-
-    // Clear callback state globals
-    CURRENT_HOOK_CTX_PTR.store(0, Ordering::Relaxed);
-    CURRENT_HOOK_ART_METHOD.store(0, Ordering::Relaxed);
 }

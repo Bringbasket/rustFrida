@@ -7,17 +7,115 @@ use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
     get_js_u64_property, invoke_hook_callback_common, js_u64_to_js_number_or_bigint,
+    js_value_to_u64_or_zero,
     set_js_cfunction_property, set_js_u64_property,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use super::registry::HOOK_REGISTRY;
 
-// Global state for the currently executing native hook callback.
-// Protected by JS_ENGINE lock (single-threaded JS execution).
-static CURRENT_NATIVE_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
-static CURRENT_NATIVE_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
-static CURRENT_NATIVE_ORIG_CALLED: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy)]
+struct NativeHookFrame {
+    ctx_ptr: usize,
+    trampoline: u64,
+    orig_called: bool,
+}
+
+// JS 回调在全局引擎锁下串行执行，因此用一个栈保存 native hook 回调状态即可支持嵌套 hook。
+static NATIVE_HOOK_STACK: Mutex<Vec<NativeHookFrame>> = Mutex::new(Vec::new());
+static IN_FLIGHT_NATIVE_HOOK_CALLBACKS: Mutex<usize> = Mutex::new(0);
+static IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV: Condvar = Condvar::new();
+
+struct InFlightNativeHookGuard;
+
+impl InFlightNativeHookGuard {
+    fn enter() -> Self {
+        let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *in_flight += 1;
+        Self
+    }
+}
+
+impl Drop for InFlightNativeHookGuard {
+    fn drop(&mut self) {
+        let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        if *in_flight == 0 {
+            IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV.notify_all();
+        }
+    }
+}
+
+fn push_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) {
+    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
+    stack.push(NativeHookFrame {
+        ctx_ptr: ctx_ptr as usize,
+        trampoline,
+        orig_called: false,
+    });
+}
+
+fn pop_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
+    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(frame) = stack.pop() {
+        debug_assert_eq!(frame.ctx_ptr, ctx_ptr as usize);
+        debug_assert_eq!(frame.trampoline, trampoline);
+        frame.orig_called
+    } else {
+        false
+    }
+}
+
+fn mark_native_hook_frame_orig_called(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    trampoline: u64,
+) -> bool {
+    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(frame) = stack
+        .iter_mut()
+        .rfind(|frame| frame.ctx_ptr == ctx_ptr as usize && frame.trampoline == trampoline)
+    {
+        frame.orig_called = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
+    let stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
+    stack.last().map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
+}
+
+pub(super) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while *in_flight != 0 {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return false;
+        };
+        let (guard, wait_result) = IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV
+            .wait_timeout(in_flight, remaining)
+            .unwrap_or_else(|e| e.into_inner());
+        in_flight = guard;
+        if wait_result.timed_out() && *in_flight != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub(super) fn in_flight_native_hook_callbacks() -> usize {
+    *IN_FLIGHT_NATIVE_HOOK_CALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// Hook callback that calls the JS function (replace mode)
 pub(crate) unsafe extern "C" fn hook_callback_wrapper(
@@ -27,6 +125,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
+    let _in_flight_guard = InFlightNativeHookGuard::enter();
 
     let target_addr = user_data as u64;
 
@@ -51,10 +150,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         )
     }; // HOOK_REGISTRY lock released here
 
-    // Set global state for js_native_call_original
-    CURRENT_NATIVE_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
-    CURRENT_NATIVE_TRAMPOLINE.store(trampoline, Ordering::Relaxed);
-    CURRENT_NATIVE_ORIG_CALLED.store(false, Ordering::Relaxed);
+    push_native_hook_frame(ctx_ptr, trampoline);
 
     // Track whether the JS callback completed without exception and wrote back x0.
     let mut result_was_set = false;
@@ -76,28 +172,34 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
             set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
             set_js_u64_property(ctx, js_ctx, "trampoline", trampoline);
+            // Bind callback-local state to the context object so ctx.orig() remains stable
+            // even if nested hooks temporarily overwrite the global fallback state.
+            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
+            set_js_u64_property(ctx, js_ctx, "__hookTrampoline", trampoline);
             set_js_cfunction_property(ctx, js_ctx, "orig", js_native_call_original, 0);
 
             js_ctx
         },
         // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
-        |ctx, js_ctx, _result| {
+        |ctx, js_ctx, result| {
             result_was_set = true;
-            (*ctx_ptr).x[0] = get_js_u64_property(ctx, js_ctx, "x0");
+            let result_val = ffi::JSValue { u: result.u, tag: result.tag };
+            if ffi::qjs_is_undefined(result_val) == 0 {
+                (*ctx_ptr).x[0] = js_value_to_u64_or_zero(ctx, crate::value::JSValue(result_val));
+            } else {
+                (*ctx_ptr).x[0] = get_js_u64_property(ctx, js_ctx, "x0");
+            }
         },
     );
 
+    let orig_called = pop_native_hook_frame(ctx_ptr, trampoline);
+
     // Fallback: if the JS callback was skipped (engine busy) or threw an exception,
     // treat the hook as transparent and invoke the original function.
-    if !result_was_set && trampoline != 0 && !CURRENT_NATIVE_ORIG_CALLED.load(Ordering::Relaxed) {
+    if !result_was_set && trampoline != 0 && !orig_called {
         (*ctx_ptr).x[0] =
             hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
     }
-
-    // Clear global state
-    CURRENT_NATIVE_ORIG_CALLED.store(false, Ordering::Relaxed);
-    CURRENT_NATIVE_CTX_PTR.store(0, Ordering::Relaxed);
-    CURRENT_NATIVE_TRAMPOLINE.store(0, Ordering::Relaxed);
 }
 
 /// JS CFunction: ctx.orig()
@@ -105,12 +207,30 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
 /// Returns the result as BigUint64, also writes it to ctx.x[0].
 unsafe extern "C" fn js_native_call_original(
     ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
+    this_val: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let ctx_ptr = CURRENT_NATIVE_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext;
-    let trampoline = CURRENT_NATIVE_TRAMPOLINE.load(Ordering::Relaxed);
+    let ctx_ptr = {
+        let value = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
+        if !value.is_null() {
+            value
+        } else {
+            current_native_hook_frame()
+                .map(|(ctx_ptr, _)| ctx_ptr)
+                .unwrap_or(std::ptr::null_mut())
+        }
+    };
+    let trampoline = {
+        let value = get_js_u64_property(ctx, this_val, "__hookTrampoline");
+        if value != 0 {
+            value
+        } else {
+            current_native_hook_frame()
+                .map(|(_, trampoline)| trampoline)
+                .unwrap_or(0)
+        }
+    };
 
     if ctx_ptr.is_null() || trampoline == 0 {
         return ffi::JS_ThrowInternalError(
@@ -119,7 +239,7 @@ unsafe extern "C" fn js_native_call_original(
         );
     }
 
-    CURRENT_NATIVE_ORIG_CALLED.store(true, Ordering::Relaxed);
+    let _ = mark_native_hook_frame_orig_called(ctx_ptr, trampoline);
     let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
 
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value
