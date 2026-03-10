@@ -4,11 +4,8 @@
 
 /// Parse /proc/self/maps to find the libart.so address range and file path.
 pub(crate) fn probe_libart_range() -> (u64, u64) {
-    let maps = match super::util::read_proc_self_maps() {
-        Some(s) => s,
-        None => return (0, 0),
-    };
-    let summary = summarize_matching_paths(&maps, |path| path.contains("libart.so"));
+    let snapshot = ModuleSnapshot::load_current();
+    let summary = snapshot.summarize_matching_paths(|path| path.contains("libart.so"));
     let found_path = summary.as_ref().map(|summary| summary.first_path.clone());
 
     let _ = LIBART_PATH.set(found_path.clone());
@@ -27,25 +24,26 @@ pub(crate) fn probe_libart_range() -> (u64, u64) {
 /// 通过 /proc/self/maps 获取指定模块的地址范围 (start, end)。
 /// 返回 (0, 0) 表示未找到。
 pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
-    let maps = match super::util::read_proc_self_maps() {
-        Some(s) => s,
-        None => return (0, 0),
-    };
-
-    summarize_matching_paths(&maps, |path| matches_exact_module_name(path, module_name))
+    let snapshot = ModuleSnapshot::load_current();
+    snapshot
+        .summarize_matching_paths(|path| matches_exact_module_name(path, module_name))
         .map(|summary| (summary.base, summary.end))
         .unwrap_or((0, 0))
 }
 
 /// Parse /proc/self/maps to find a module's base address.
 fn find_module_base(module_name: &str) -> u64 {
-    let maps = match super::util::read_proc_self_maps() {
-        Some(s) => s,
-        None => return 0,
-    };
+    {
+        let guard = module_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(base) = guard.snapshot.find_module_base(module_name) {
+            return base;
+        }
+    }
 
-    find_first_matching_path_start(&maps, |path| matches_module_lookup_name(path, module_name))
-        .unwrap_or(0)
+    let snapshot = refresh_module_snapshot_cache();
+    snapshot.find_module_base(module_name).unwrap_or(0)
 }
 
 /// Module info from /proc/self/maps
@@ -103,6 +101,141 @@ impl ModuleMapEntry {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ModuleSnapshot {
+    entries: Vec<ModuleMapEntry>,
+    modules: Vec<ModuleInfo>,
+    modules_by_path: HashMap<String, ModuleInfo>,
+}
+
+impl ModuleSnapshot {
+    fn from_entries(mut entries: Vec<ModuleMapEntry>) -> Self {
+        entries.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| a.end.cmp(&b.end))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        let modules = aggregate_modules(&entries);
+        let modules_by_path = modules
+            .iter()
+            .cloned()
+            .map(|module| (module.path.clone(), module))
+            .collect();
+
+        Self {
+            entries,
+            modules,
+            modules_by_path,
+        }
+    }
+
+    fn load_current() -> Self {
+        Self::from_entries(read_module_map_entries())
+    }
+
+    fn summarize_matching_paths(
+        &self,
+        mut matches_path: impl FnMut(&str) -> bool,
+    ) -> Option<PathMapSummary> {
+        let mut base = u64::MAX;
+        let mut end = 0;
+        let mut first_path = None;
+
+        for entry in &self.entries {
+            let path = entry.path.as_str();
+            if !matches_path(path) {
+                continue;
+            }
+
+            if entry.start < base {
+                base = entry.start;
+            }
+            if entry.end > end {
+                end = entry.end;
+            }
+            if first_path.is_none() {
+                first_path = Some(path.to_string());
+            }
+        }
+
+        first_path.map(|first_path| PathMapSummary {
+            base,
+            end,
+            first_path,
+        })
+    }
+
+    fn find_module_base(&self, module_name: &str) -> Option<u64> {
+        self.entries.iter().find_map(|entry| {
+            matches_module_lookup_name(&entry.path, module_name).then_some(entry.start)
+        })
+    }
+
+    fn find_module_by_address(&self, addr: u64) -> Option<(ModuleMapEntry, ModuleInfo)> {
+        let entry = self
+            .entries
+            .iter()
+            .filter(|entry| entry.contains(addr))
+            .min_by(|a, b| {
+                a.path_score()
+                    .cmp(&b.path_score())
+                    .then_with(|| (a.end - a.start).cmp(&(b.end - b.start)))
+                    .then_with(|| b.start.cmp(&a.start))
+            })
+            .cloned()?;
+
+        let module = self.modules_by_path.get(&entry.path)?.clone();
+        Some((entry, module))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AddressLookupHint {
+    entry: ModuleMapEntry,
+    module: ModuleInfo,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModuleCache {
+    snapshot: ModuleSnapshot,
+    lookup_hint: Option<AddressLookupHint>,
+}
+
+impl ModuleCache {
+    fn new(snapshot: ModuleSnapshot) -> Self {
+        Self {
+            snapshot,
+            lookup_hint: None,
+        }
+    }
+
+    fn refresh_snapshot(&mut self, snapshot: ModuleSnapshot) {
+        self.snapshot = snapshot;
+        self.lookup_hint = None;
+    }
+
+    fn lookup_hint(&self, addr: u64) -> Option<ModuleInfo> {
+        self.lookup_hint
+            .as_ref()
+            .filter(|hint| hint.entry.contains(addr))
+            .map(|hint| hint.module.clone())
+    }
+
+    fn update_lookup_hint(&mut self, entry: ModuleMapEntry, module: ModuleInfo) -> ModuleInfo {
+        self.lookup_hint = Some(AddressLookupHint {
+            entry,
+            module: module.clone(),
+        });
+        module
+    }
+}
+
+static MODULE_CACHE: std::sync::OnceLock<std::sync::RwLock<ModuleCache>> =
+    std::sync::OnceLock::new();
+
+#[derive(Clone, Debug)]
 struct AggregatedModuleRange {
     path: String,
     base: u64,
@@ -139,7 +272,7 @@ fn parse_module_map_entries(maps: &str) -> Vec<ModuleMapEntry> {
         .collect()
 }
 
-fn enumerate_module_map_entries() -> Vec<ModuleMapEntry> {
+fn read_module_map_entries() -> Vec<ModuleMapEntry> {
     let maps = match super::util::read_proc_self_maps() {
         Some(s) => s,
         None => return Vec::new(),
@@ -148,59 +281,96 @@ fn enumerate_module_map_entries() -> Vec<ModuleMapEntry> {
     parse_module_map_entries(&maps)
 }
 
-fn aggregate_modules(entries: impl IntoIterator<Item = ModuleMapEntry>) -> Vec<ModuleInfo> {
-    let entries: Vec<_> = entries.into_iter().collect();
+fn module_cache() -> &'static std::sync::RwLock<ModuleCache> {
+    MODULE_CACHE
+        .get_or_init(|| std::sync::RwLock::new(ModuleCache::new(ModuleSnapshot::load_current())))
+}
+
+fn refresh_module_snapshot_cache() -> ModuleSnapshot {
+    let snapshot = ModuleSnapshot::load_current();
+    let mut guard = module_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.refresh_snapshot(snapshot.clone());
+    snapshot
+}
+
+fn aggregate_modules(entries: &[ModuleMapEntry]) -> Vec<ModuleInfo> {
     collect_module_ranges(entries.iter())
         .into_iter()
         .map(AggregatedModuleRange::into_module_info)
         .collect()
 }
 
-fn aggregate_module_for_path(entries: &[ModuleMapEntry], path: &str) -> Option<ModuleInfo> {
-    collect_module_ranges(entries.iter())
-        .into_iter()
-        .find(|module| module.path == path)
-        .map(AggregatedModuleRange::into_module_info)
-}
-
 /// Parse /proc/self/maps and aggregate VMAs per unique path.
 fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
-    aggregate_modules(enumerate_module_map_entries())
+    refresh_module_snapshot_cache().modules
 }
 
+#[cfg(test)]
 fn find_module_by_address_in_entries(
     entries: impl IntoIterator<Item = ModuleMapEntry>,
     addr: u64,
 ) -> Option<ModuleInfo> {
-    let entries: Vec<_> = entries.into_iter().collect();
-    let path = entries
-        .iter()
-        .filter(|entry| entry.contains(addr))
-        .min_by(|a, b| {
-            a.path_score()
-                .cmp(&b.path_score())
-                .then_with(|| (a.end - a.start).cmp(&(b.end - b.start)))
-                .then_with(|| b.start.cmp(&a.start))
-        })
-        .map(|entry| entry.path.clone())?;
+    let snapshot = ModuleSnapshot::from_entries(entries.into_iter().collect());
+    snapshot
+        .find_module_by_address(addr)
+        .map(|(_, module)| module)
+}
 
-    aggregate_module_for_path(&entries, &path)
+fn try_find_module_by_address_in_cache(addr: u64) -> Option<ModuleInfo> {
+    {
+        let guard = module_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(module) = guard.lookup_hint(addr) {
+            return Some(module);
+        }
+    }
+
+    let mut guard = module_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(module) = guard.lookup_hint(addr) {
+        return Some(module);
+    }
+
+    let (entry, module) = guard.snapshot.find_module_by_address(addr)?;
+    Some(guard.update_lookup_hint(entry, module))
+}
+
+fn refresh_and_find_module_by_address(addr: u64) -> Option<ModuleInfo> {
+    let snapshot = ModuleSnapshot::load_current();
+    let found = snapshot.find_module_by_address(addr);
+
+    let mut guard = module_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.refresh_snapshot(snapshot);
+    guard.lookup_hint = found.as_ref().map(|(entry, module)| AddressLookupHint {
+        entry: entry.clone(),
+        module: module.clone(),
+    });
+
+    found.map(|(_, module)| module)
 }
 
 /// Find the module containing `addr` and return the module-wide aggregated range.
 fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
-    find_module_by_address_in_entries(enumerate_module_map_entries(), addr)
+    try_find_module_by_address_in_cache(addr).or_else(|| refresh_and_find_module_by_address(addr))
 }
 
 fn collect_module_ranges<'a>(
     entries: impl IntoIterator<Item = &'a ModuleMapEntry>,
 ) -> Vec<AggregatedModuleRange> {
+    let mut module_indices: HashMap<&str, usize> = HashMap::new();
     let mut modules: Vec<AggregatedModuleRange> = Vec::new();
 
     for entry in entries {
-        if let Some(module) = modules.iter_mut().find(|module| module.path == entry.path) {
-            module.include(entry);
+        if let Some(&index) = module_indices.get(entry.path.as_str()) {
+            modules[index].include(entry);
         } else {
+            module_indices.insert(entry.path.as_str(), modules.len());
             modules.push(AggregatedModuleRange::from_entry(entry));
         }
     }
@@ -231,50 +401,6 @@ struct PathMapSummary {
     base: u64,
     end: u64,
     first_path: String,
-}
-
-fn summarize_matching_paths(
-    maps: &str,
-    mut matches_path: impl FnMut(&str) -> bool,
-) -> Option<PathMapSummary> {
-    let mut base = u64::MAX;
-    let mut end = 0;
-    let mut first_path = None;
-
-    for entry in crate::jsapi::util::proc_maps_entries(maps) {
-        let Some(path) = entry.path else {
-            continue;
-        };
-        if !matches_path(path) {
-            continue;
-        }
-
-        if entry.start < base {
-            base = entry.start;
-        }
-        if entry.end > end {
-            end = entry.end;
-        }
-        if first_path.is_none() {
-            first_path = Some(path.to_string());
-        }
-    }
-
-    first_path.map(|first_path| PathMapSummary {
-        base,
-        end,
-        first_path,
-    })
-}
-
-fn find_first_matching_path_start(
-    maps: &str,
-    mut matches_path: impl FnMut(&str) -> bool,
-) -> Option<u64> {
-    crate::jsapi::util::proc_maps_entries(maps).find_map(|entry| {
-        let path = entry.path?;
-        matches_path(path).then_some(entry.start)
-    })
 }
 
 #[cfg(test)]
@@ -311,7 +437,8 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
 2000-2800 r--p 00001000 00:00 0 /tmp/libfoo.so
 ";
 
-        let modules = aggregate_modules(parse_module_map_entries(maps));
+        let entries = parse_module_map_entries(maps);
+        let modules = aggregate_modules(&entries);
 
         assert_eq!(
             modules,
